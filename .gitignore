@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+kufar_bot.db
+kufar_bot.db-journal
+*.log
