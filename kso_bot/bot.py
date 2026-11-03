@@ -10,13 +10,18 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
+from aiogram.filters.chat_member_updated import (
+    JOIN_TRANSITION,
+    LEAVE_TRANSITION,
+    ChatMemberUpdatedFilter,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import ADMIN_IDS, BOT_TOKEN, CHECK_INTERVAL_SECONDS
 from database import (
@@ -42,6 +47,27 @@ MINSK_TZ = timezone(timedelta(hours=3))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+
+class AutoRegisterMiddleware(BaseMiddleware):
+    """
+    Automatically registers any chat (private, group, supergroup) as a subscriber
+    whenever any message or button click occurs.
+    """
+    async def __call__(self, handler, event, data):
+        chat = getattr(event, "chat", None)
+        if not chat:
+            msg = getattr(event, "message", None)
+            if msg:
+                chat = getattr(msg, "chat", None)
+        if chat:
+            title = chat.title or chat.full_name or ""
+            add_subscriber(chat.id, chat.type, title)
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(AutoRegisterMiddleware())
+dp.callback_query.outer_middleware(AutoRegisterMiddleware())
 
 
 class AdminStates(StatesGroup):
@@ -98,6 +124,33 @@ def get_schedule_for_date(target_dt: datetime) -> str:
         parsed_substitutions=None,
         last_update_info=last_file_info
     )
+
+
+# When bot is added to a group or channel
+@dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=JOIN_TRANSITION))
+async def on_bot_joined_chat(event: ChatMemberUpdated):
+    chat = event.chat
+    add_subscriber(chat.id, chat.type, chat.title or "")
+    logging.info(f"Bot joined chat: {chat.title} ({chat.id})")
+    try:
+        await bot.send_message(
+            chat_id=chat.id,
+            text=(
+                "👋 <b>Бот замен группы 02-24 подключен к беседе!</b>\n\n"
+                "• Когда на Google Диске появятся новые замены — расписание автоматически придёт сюда и закрепится.\n"
+                "• Чтобы узнать расписание прямо сейчас, используйте команду /today или /tomorrow."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard()
+        )
+    except Exception as e:
+        logging.warning(f"Could not send welcome message to group {chat.id}: {e}")
+
+
+@dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=LEAVE_TRANSITION))
+async def on_bot_left_chat(event: ChatMemberUpdated):
+    remove_subscriber(event.chat.id)
+    logging.info(f"Bot removed from chat: {event.chat.id}")
 
 
 @dp.message(CommandStart())
@@ -257,10 +310,6 @@ async def process_broadcast_text(message: types.Message, state: FSMContext):
 # ================= BACKGROUND MONITORING =================
 
 async def check_and_broadcast_updates(force: bool = False) -> int:
-    """
-    Checks Google Drive for new PDF files.
-    If new file found, parses, broadcasts schedule, and pins message.
-    """
     processed_count = 0
     try:
         files = fetch_drive_file_list()

@@ -22,6 +22,8 @@ def init_db():
             processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Pre-seed admin so it's always included
+    cur.execute("INSERT OR IGNORE INTO subscribers (chat_id, chat_type, title) VALUES (1462879969, 'private', 'Admin')")
     conn.commit()
     conn.close()
 
