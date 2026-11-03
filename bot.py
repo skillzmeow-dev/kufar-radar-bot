@@ -95,12 +95,22 @@ async def main():
     port = int(os.getenv("PORT", "8080"))
     health_runner = await start_health_server(port)
 
+    # Запуск бота замен колледжа
+    kso_proc = None
+    kso_script = os.path.join(os.path.dirname(__file__), "kso_bot", "bot.py")
+    if os.path.exists(kso_script):
+        logger.info("Запуск KSO Schedule Bot (@mgksoz_bot)...")
+        import subprocess
+        kso_proc = subprocess.Popen([sys.executable, "-u", kso_script])
+
     logger.info("Бот успешно запущен и готов к работе!")
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
+        if kso_proc:
+            kso_proc.terminate()
         watcher.stop()
         channel_poster.stop()
         watcher_task.cancel()
