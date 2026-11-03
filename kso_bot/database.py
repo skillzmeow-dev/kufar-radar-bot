@@ -85,3 +85,6 @@ def mark_file_processed(filename: str, file_id: str, date_str: str):
     """, (filename, file_id, date_str))
     conn.commit()
     conn.close()
+
+# Auto-init tables on import
+init_db()
