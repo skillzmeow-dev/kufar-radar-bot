@@ -103,25 +103,46 @@ async def cmd_start(message: types.Message):
     await message.answer(welcome_text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 
+async def send_and_pin_schedule(chat_id: int, text: str):
+    """
+    Sends schedule message with inline buttons and automatically pins it.
+    """
+    msg = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_main_keyboard()
+    )
+    try:
+        await bot.pin_chat_message(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            disable_notification=False
+        )
+    except Exception as e:
+        logging.warning(f"Could not pin message in {chat_id}: {e}")
+    return msg
+
+
 @dp.message(Command("today"))
 async def cmd_today(message: types.Message):
     now_minsk = datetime.now(MINSK_TZ)
     text = get_schedule_for_date(now_minsk)
-    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+    await send_and_pin_schedule(message.chat.id, text)
 
 
 @dp.message(Command("tomorrow"))
 async def cmd_tomorrow(message: types.Message):
     tomorrow_minsk = datetime.now(MINSK_TZ) + timedelta(days=1)
     text = get_schedule_for_date(tomorrow_minsk)
-    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+    await send_and_pin_schedule(message.chat.id, text)
 
 
 @dp.callback_query(F.data == "schedule_today")
 async def cb_today(call: types.CallbackQuery):
     now_minsk = datetime.now(MINSK_TZ)
     text = get_schedule_for_date(now_minsk)
-    await call.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+    await send_and_pin_schedule(call.message.chat.id, text)
     await call.answer()
 
 
@@ -129,7 +150,7 @@ async def cb_today(call: types.CallbackQuery):
 async def cb_tomorrow(call: types.CallbackQuery):
     tomorrow_minsk = datetime.now(MINSK_TZ) + timedelta(days=1)
     text = get_schedule_for_date(tomorrow_minsk)
-    await call.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
+    await send_and_pin_schedule(call.message.chat.id, text)
     await call.answer()
 
 
