@@ -6,6 +6,9 @@ DRIVE_FOLDER_URL = "https://drive.google.com/drive/folders/1VHwxwQMbrX7na1srshRR
 GROUP_NAME = "02-24"
 GROUP_ALIASES = ["224", "02-24", "02-24 РУБ", "0224"]
 
+# Admin user IDs
+ADMIN_IDS = [1462879969]
+
 # Check interval in seconds (e.g. 180 seconds = 3 minutes)
 CHECK_INTERVAL_SECONDS = 180
 

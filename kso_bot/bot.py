@@ -13,11 +13,15 @@ if SCRIPT_DIR not in sys.path:
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from config import BOT_TOKEN, CHECK_INTERVAL_SECONDS
+from config import ADMIN_IDS, BOT_TOKEN, CHECK_INTERVAL_SECONDS
 from database import (
     add_subscriber,
+    get_stats,
     get_subscribers,
     init_db,
     is_file_processed,
@@ -37,33 +41,43 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 MINSK_TZ = timezone(timedelta(hours=3))
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
+
+
+class AdminStates(StatesGroup):
+    waiting_for_broadcast = State()
+
 
 def get_main_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="📅 Расписание на сегодня", callback_data="schedule_today"),
             InlineKeyboardButton(text="⏭ Расписание на завтра", callback_data="schedule_tomorrow")
         ]
     ])
-    return kb
+
+
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Проверить замены сейчас", callback_data="admin_check_now"),
+        ],
+        [
+            InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin_broadcast"),
+        ],
+        [
+            InlineKeyboardButton(text="❌ Закрыть", callback_data="admin_close")
+        ]
+    ])
 
 
 def get_schedule_for_date(target_dt: datetime) -> str:
-    """
-    Finds if substitutions exist on Drive for target_dt.
-    If yes, parses and merges with regular schedule.
-    If no, returns standard regular schedule with note about latest file on Drive.
-    """
     target_date_str = target_dt.strftime("%d.%m.%Y")
     target_day_index = target_dt.weekday()
 
-    # Fetch file list from Google Drive
     drive_files = fetch_drive_file_list()
     last_file_info = drive_files[0]['filename'].replace('.pdf', '') if drive_files else ""
 
-    # Look for matching file for target_date_str
-    # Handles both '02.11.2026.pdf' and '02.11.26.pdf'
     short_date_str = target_dt.strftime("%d.%m.%y")
     matching_file = None
     for f in drive_files:
@@ -78,7 +92,6 @@ def get_schedule_for_date(target_dt: datetime) -> str:
             parsed = parse_pdf_substitutions(local_path)
             return build_schedule_message(target_date_str, target_day_index, parsed)
 
-    # Fallback to standard schedule
     return build_schedule_message(
         target_date_str=target_date_str,
         target_day_index=target_day_index,
@@ -89,7 +102,6 @@ def get_schedule_for_date(target_dt: datetime) -> str:
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    # Register chat for auto notifications
     chat_type = message.chat.type
     title = message.chat.title or message.chat.full_name or ""
     add_subscriber(message.chat.id, chat_type, title)
@@ -97,52 +109,31 @@ async def cmd_start(message: types.Message):
     welcome_text = (
         f"👋 <b>Привет! Я бот замен и расписания для группы 02-24 РУБ.</b>\n\n"
         f"• Я автоматически отслеживаю Google Диск колледжа на наличие новых замен.\n"
-        f"• Когда появляются новые замены — я присылаю готовое расписание и закрепляю его в чате.\n\n"
+        f"• Когда появляются новые замены — я присылаю готовое расписание и автоматически закрепляю его в чате.\n\n"
         f"Выбери нужный день кнопками ниже:"
     )
     await message.answer(welcome_text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
-
-
-async def send_and_pin_schedule(chat_id: int, text: str):
-    """
-    Sends schedule message with inline buttons and automatically pins it.
-    """
-    msg = await bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=get_main_keyboard()
-    )
-    try:
-        await bot.pin_chat_message(
-            chat_id=chat_id,
-            message_id=msg.message_id,
-            disable_notification=False
-        )
-    except Exception as e:
-        logging.warning(f"Could not pin message in {chat_id}: {e}")
-    return msg
 
 
 @dp.message(Command("today"))
 async def cmd_today(message: types.Message):
     now_minsk = datetime.now(MINSK_TZ)
     text = get_schedule_for_date(now_minsk)
-    await send_and_pin_schedule(message.chat.id, text)
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 
 @dp.message(Command("tomorrow"))
 async def cmd_tomorrow(message: types.Message):
     tomorrow_minsk = datetime.now(MINSK_TZ) + timedelta(days=1)
     text = get_schedule_for_date(tomorrow_minsk)
-    await send_and_pin_schedule(message.chat.id, text)
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 
 @dp.callback_query(F.data == "schedule_today")
 async def cb_today(call: types.CallbackQuery):
     now_minsk = datetime.now(MINSK_TZ)
     text = get_schedule_for_date(now_minsk)
-    await send_and_pin_schedule(call.message.chat.id, text)
+    await call.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
     await call.answer()
 
 
@@ -150,96 +141,203 @@ async def cb_today(call: types.CallbackQuery):
 async def cb_tomorrow(call: types.CallbackQuery):
     tomorrow_minsk = datetime.now(MINSK_TZ) + timedelta(days=1)
     text = get_schedule_for_date(tomorrow_minsk)
-    await send_and_pin_schedule(call.message.chat.id, text)
+    await call.message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
     await call.answer()
 
 
-async def check_drive_updates_loop():
-    """
-    Background worker that checks Google Drive every CHECK_INTERVAL_SECONDS.
-    When a new substitutions file is uploaded, builds schedule and broadcasts to all chats,
-    then automatically pins the message.
-    """
-    while True:
+# ================= ADMIN PANEL =================
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    stats = get_stats()
+    files_str = "\n".join([f"• <code>{f[0]}</code> ({f[1]})" for f in stats['last_files']]) or "Нет данных"
+
+    text = (
+        f"👑 <b>Админ-панель бота замен 02-24</b>\n\n"
+        f"📊 <b>Статистика подписчиков:</b>\n"
+        f"• Всего чатов: <b>{stats['total']}</b>\n"
+        f"• В личных сообщениях: <b>{stats['private']}</b>\n"
+        f"• В группах/беседах: <b>{stats['groups']}</b>\n\n"
+        f"📁 <b>Последние обработанные файлы:</b>\n{files_str}"
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=get_admin_keyboard())
+
+
+@dp.callback_query(F.data == "admin_close")
+async def cb_admin_close(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+    await call.message.delete()
+    await call.answer()
+
+
+@dp.callback_query(F.data == "admin_check_now")
+async def cb_admin_check_now(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    await call.answer("Проверяю Google Диск...", show_alert=False)
+    processed_count = await check_and_broadcast_updates(force=True)
+    stats = get_stats()
+    files_str = "\n".join([f"• <code>{f[0]}</code> ({f[1]})" for f in stats['last_files']]) or "Нет данных"
+
+    text = (
+        f"👑 <b>Админ-панель бота замен 02-24</b>\n\n"
+        f"✅ <b>Проверка завершена!</b> Новых файлов обработано: {processed_count}\n\n"
+        f"📊 <b>Статистика:</b>\n"
+        f"• Всего чатов: <b>{stats['total']}</b> (ЛС: {stats['private']}, Групп: {stats['groups']})\n\n"
+        f"📁 <b>Последние файлы:</b>\n{files_str}"
+    )
+    try:
+        await call.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=get_admin_keyboard())
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def cb_admin_broadcast(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await call.message.answer(
+        "✍️ <b>Введи текст сообщения для рассылки всем подписчикам:</b>\n"
+        "<i>(Или отправь /cancel для отмены)</i>",
+        parse_mode=ParseMode.HTML
+    )
+    await call.answer()
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        return
+    await state.clear()
+    await message.answer("❌ Действие отменено.")
+
+
+@dp.message(AdminStates.waiting_for_broadcast)
+async def process_broadcast_text(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    broadcast_text = message.text or message.caption or ""
+    await state.clear()
+
+    subscribers = get_subscribers()
+    sent_count = 0
+    fail_count = 0
+
+    progress_msg = await message.answer(f"⏳ Отправка рассылки {len(subscribers)} чатам...")
+
+    for chat_id, chat_type in subscribers:
         try:
-            files = fetch_drive_file_list()
-            for f in files:
-                fname = f['filename']
-                fid = f['file_id']
+            await bot.send_message(
+                chat_id=chat_id,
+                text=broadcast_text,
+                parse_mode=ParseMode.HTML
+            )
+            sent_count += 1
+        except Exception:
+            fail_count += 1
+        await asyncio.sleep(0.05)
 
-                if not is_file_processed(fname):
-                    logging.info(f"New file found on Google Drive: {fname}")
-                    local_path = download_drive_file(fid, fname)
-                    if not local_path:
-                        continue
+    await progress_msg.edit_text(
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"• Успешно отправлено: <b>{sent_count}</b>\n"
+        f"• Ошибок отправки: <b>{fail_count}</b>",
+        parse_mode=ParseMode.HTML
+    )
 
-                    parsed = parse_pdf_substitutions(local_path)
-                    
-                    # Determine date and day index
-                    target_date_str = parsed.get('date_str', '')
-                    # If date_str is missing or short, try parse from filename e.g. 02.11.2026.pdf
-                    if not target_date_str:
-                        m = re.match(r'(\d{2}\.\d{2}\.\d{4})', fname)
-                        if m:
-                            target_date_str = m.group(1)
 
-                    target_day_index = 0
-                    if target_date_str:
+# ================= BACKGROUND MONITORING =================
+
+async def check_and_broadcast_updates(force: bool = False) -> int:
+    """
+    Checks Google Drive for new PDF files.
+    If new file found, parses, broadcasts schedule, and pins message.
+    """
+    processed_count = 0
+    try:
+        files = fetch_drive_file_list()
+        for f in files:
+            fname = f['filename']
+            fid = f['file_id']
+
+            if force or not is_file_processed(fname):
+                logging.info(f"Processing substitutions file: {fname}")
+                local_path = download_drive_file(fid, fname)
+                if not local_path:
+                    continue
+
+                parsed = parse_pdf_substitutions(local_path)
+                target_date_str = parsed.get('date_str', '')
+                if not target_date_str:
+                    m = re.match(r'(\d{2}\.\d{2}\.\d{4})', fname)
+                    if m:
+                        target_date_str = m.group(1)
+
+                target_day_index = 0
+                if target_date_str:
+                    try:
+                        if len(target_date_str.split('.')[-1]) == 4:
+                            dt = datetime.strptime(target_date_str, "%d.%m.%Y")
+                        else:
+                            dt = datetime.strptime(target_date_str, "%d.%m.%y")
+                        target_day_index = dt.weekday()
+                    except Exception:
+                        pass
+
+                schedule_text = build_schedule_message(
+                    target_date_str=target_date_str or fname.replace('.pdf', ''),
+                    target_day_index=target_day_index,
+                    parsed_substitutions=parsed
+                )
+
+                subscribers = get_subscribers()
+                for chat_id, chat_type in subscribers:
+                    try:
+                        sent_msg = await bot.send_message(
+                            chat_id=chat_id,
+                            text=schedule_text,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=get_main_keyboard()
+                        )
+                        # ONLY auto-broadcasted messages are pinned
                         try:
-                            # Try 4-digit year or 2-digit year
-                            if len(target_date_str.split('.')[-1]) == 4:
-                                dt = datetime.strptime(target_date_str, "%d.%m.%Y")
-                            else:
-                                dt = datetime.strptime(target_date_str, "%d.%m.%y")
-                            target_day_index = dt.weekday()
-                        except Exception:
-                            pass
-
-                    # Build schedule
-                    schedule_text = build_schedule_message(
-                        target_date_str=target_date_str or fname.replace('.pdf', ''),
-                        target_day_index=target_day_index,
-                        parsed_substitutions=parsed
-                    )
-
-                    # Broadcast to subscribers
-                    subscribers = get_subscribers()
-                    for chat_id, chat_type in subscribers:
-                        try:
-                            sent_msg = await bot.send_message(
+                            await bot.pin_chat_message(
                                 chat_id=chat_id,
-                                text=schedule_text,
-                                parse_mode=ParseMode.HTML,
-                                reply_markup=get_main_keyboard()
+                                message_id=sent_msg.message_id,
+                                disable_notification=False
                             )
-                            # Automatically pin message as requested by user
-                            try:
-                                await bot.pin_chat_message(
-                                    chat_id=chat_id,
-                                    message_id=sent_msg.message_id,
-                                    disable_notification=False
-                                )
-                            except Exception as pin_err:
-                                # Pinning might fail if bot lacks admin rights in a group, ignore
-                                logging.debug(f"Could not pin in chat {chat_id}: {pin_err}")
-                        except Exception as send_err:
-                            logging.error(f"Failed to send update to {chat_id}: {send_err}")
+                        except Exception as pin_err:
+                            logging.debug(f"Could not pin in chat {chat_id}: {pin_err}")
+                    except Exception as send_err:
+                        logging.error(f"Failed to send update to {chat_id}: {send_err}")
 
-                    # Mark file as processed
-                    mark_file_processed(fname, fid, target_date_str)
-                    logging.info(f"File {fname} processed and broadcasted to {len(subscribers)} chats.")
-        except Exception as e:
-            logging.error(f"Error in check_drive_updates_loop: {e}")
+                mark_file_processed(fname, fid, target_date_str)
+                processed_count += 1
+                logging.info(f"File {fname} broadcasted and pinned in {len(subscribers)} chats.")
+    except Exception as e:
+        logging.error(f"Error in check_and_broadcast_updates: {e}")
 
+    return processed_count
+
+
+async def check_drive_updates_loop():
+    while True:
+        await check_and_broadcast_updates(force=False)
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
 async def main():
     init_db()
     logging.info("Starting KSO Bot...")
-    # Start background polling task
     asyncio.create_task(check_drive_updates_loop())
-    # Start bot polling
     await dp.start_polling(bot)
 
 

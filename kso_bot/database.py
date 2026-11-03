@@ -6,7 +6,6 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "kso_bot.db")
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    # Subscribers table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS subscribers (
             chat_id INTEGER PRIMARY KEY,
@@ -15,7 +14,6 @@ def init_db():
             subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Processed files table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS processed_files (
             filename TEXT PRIMARY KEY,
@@ -51,6 +49,24 @@ def get_subscribers():
     rows = cur.fetchall()
     conn.close()
     return rows
+
+def get_stats():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM subscribers")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM subscribers WHERE chat_type = 'private'")
+    private = cur.fetchone()[0]
+    groups = total - private
+    cur.execute("SELECT filename, processed_at FROM processed_files ORDER BY processed_at DESC LIMIT 3")
+    last_files = cur.fetchall()
+    conn.close()
+    return {
+        "total": total,
+        "private": private,
+        "groups": groups,
+        "last_files": last_files
+    }
 
 def is_file_processed(filename: str) -> bool:
     conn = sqlite3.connect(DB_PATH)
