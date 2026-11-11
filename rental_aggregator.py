@@ -44,24 +44,62 @@ class RentalListing:
     description: Optional[str] = None
 
 
-def format_rooms(rooms_val: any) -> str:
+def format_rooms(rooms_val: any, rooms_label: Optional[str] = None) -> str:
+    if rooms_label and "студи" in str(rooms_label).lower():
+        return "Студия"
     if not rooms_val:
         return "Квартира"
-    s = str(rooms_val).strip()
+    s = str(rooms_val).strip().lower()
     mapping = {
         "1": "1-комнатная",
         "2": "2-комнатная",
         "3": "3-комнатная",
         "4": "4-комнатная",
         "5": "5-комнатная",
+        "6": "Студия",
+        "studio": "Студия",
         "1_room": "1-комнатная",
         "2_rooms": "2-комнатная",
         "3_rooms": "3-комнатная",
         "4_rooms": "4-комнатная",
         "5_rooms": "5-комнатная",
+        "6_rooms": "Студия",
         "room": "Комната",
     }
-    return mapping.get(s, f"{s}-комнатная")
+    if s in mapping:
+        return mapping[s]
+    if s.isdigit() and int(s) >= 7:
+        return "Квартира"
+    return f"{s}-комнатная"
+
+
+def format_rental_title(rooms_str: str) -> str:
+    if rooms_str in ("Студия", "Комната", "Квартира"):
+        return rooms_str
+    return f"{rooms_str} квартира"
+
+
+def is_minsk_city(location_text: str) -> bool:
+    text = (location_text or "").lower()
+    if "минск" not in text and "minsk" not in text:
+        return False
+    suburb_markers = (
+        "сельский совет",
+        "сельсовет",
+        "минский р-н",
+        "минский район",
+        "агрогородок",
+    )
+    return not any(m in text for m in suburb_markers)
+
+
+def is_sale_listing(title: str, description: str = "") -> bool:
+    text = f"{title} {description}".lower()
+    has_sale = bool(re.search(r"\b(продаю|продам|прода[её]тся|продажа\s+квартир\w*|на\s+продажу)\b", text))
+    if not has_sale:
+        return False
+    has_rent = bool(re.search(r"\b(сдам|сдаю|сда[её]тся|в\s+аренду|на\s+длительный\s+срок|долгосроч\w*)\b", text))
+    return not has_rent
 
 
 class RentalAggregator:
@@ -107,13 +145,20 @@ class RentalAggregator:
                     p_byn = int(int(p_byn_raw) / 100)
                     if p_usd > 4000:  # Отсекаем ошибочные продажи
                         continue
-                    usd_str = f"${p_usd:,} / мес.".replace(",", " ")
-                    byn_str = f"{p_byn:,} BYN".replace(",", " ")
+                    if p_usd <= 0 and p_byn <= 0:
+                        usd_str = "Договорная"
+                        byn_str = ""
+                    elif p_usd <= 0:
+                        usd_str = f"{p_byn:,} BYN / мес.".replace(",", " ")
+                        byn_str = ""
+                    else:
+                        usd_str = f"${p_usd:,} / мес.".replace(",", " ")
+                        byn_str = f"{p_byn:,} BYN".replace(",", " ") if p_byn > 0 else ""
                 except Exception:
                     usd_str = "Договорная"
                     byn_str = ""
 
-                # Локация
+                # Локация и параметры
                 acc_params = item.get("account_parameters", [])
                 address = "Минск"
                 for p in acc_params:
@@ -121,16 +166,27 @@ class RentalAggregator:
                         address = p.get("v", address)
                         break
 
-                # Комнаты
                 params = item.get("ad_parameters", [])
                 rooms_raw = None
+                rooms_label = None
+                region_val = None
                 for p in params:
-                    if p.get("p") == "rooms":
+                    pname = p.get("p")
+                    if pname == "rooms":
                         rooms_raw = p.get("v")
-                        break
+                        rooms_label = p.get("vl")
+                    elif pname == "region":
+                        region_val = p.get("v")
 
-                rooms_str = format_rooms(rooms_raw)
-                subject = item.get("subject") or f"{rooms_str} квартира"
+                if region_val is not None and str(region_val) != "7":
+                    continue
+                if not is_minsk_city(address):
+                    continue
+
+                rooms_str = format_rooms(rooms_raw, rooms_label)
+                subject = item.get("subject") or format_rental_title(rooms_str)
+                if is_sale_listing(subject):
+                    continue
 
                 # Фото
                 image_url = None
@@ -173,6 +229,7 @@ class RentalAggregator:
             url = (
                 f"https://r.onliner.by/sdapi/ak.api/search/apartments"
                 f"?price[min]=100&price[max]=3000&currency=usd&order=created_at:desc"
+                f"&bounds[lb][lat]=53.81&bounds[lb][long]=27.38&bounds[rt][lat]=53.975&bounds[rt][long]=27.72"
             )
             async with session.get(url, headers=HEADERS_ONLINER) as resp:
                 if resp.status != 200:
@@ -187,27 +244,43 @@ class RentalAggregator:
                 if contact.get("owner") is not True:
                     continue
 
+                # Локация (строго г. Минск, без других городов и пригородных сельсоветов)
+                loc = apt.get("location", {})
+                user_addr = loc.get("user_address") or loc.get("address") or ""
+                raw_addr = loc.get("address") or ""
+                if not is_minsk_city(f"{user_addr} {raw_addr}"):
+                    continue
+                try:
+                    lat = float(loc.get("latitude") or 0)
+                    lon = float(loc.get("longitude") or 0)
+                    if lat and lon and not (53.81 <= lat <= 53.968 and 27.39 <= lon <= 27.71):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+
                 apt_id = str(apt.get("id", ""))
                 if not apt_id:
                     continue
 
                 rent_type = apt.get("rent_type")
                 rooms_str = format_rooms(rent_type)
-                title = f"{rooms_str} квартира" if rent_type != "room" else "Комната в Минске"
+                title = format_rental_title(rooms_str)
 
                 # Цены
                 try:
                     usd_amount = int(float(apt.get("price", {}).get("converted", {}).get("USD", {}).get("amount", 0)))
                     byn_amount = int(float(apt.get("price", {}).get("converted", {}).get("BYN", {}).get("amount", 0)))
-                    usd_str = f"${usd_amount:,} / мес.".replace(",", " ")
-                    byn_str = f"{byn_amount:,} BYN".replace(",", " ")
+                    if usd_amount <= 0:
+                        usd_str = "Договорная"
+                        byn_str = ""
+                    else:
+                        usd_str = f"${usd_amount:,} / мес.".replace(",", " ")
+                        byn_str = f"{byn_amount:,} BYN".replace(",", " ") if byn_amount > 0 else ""
                 except Exception:
                     usd_str = "Договорная"
                     byn_str = ""
 
-                # Локация
-                loc = apt.get("location", {})
-                user_addr = loc.get("user_address") or loc.get("address") or "Минск"
+                user_addr = user_addr or "Минск"
 
                 link = apt.get("url") or f"https://r.onliner.by/ak/apartments/{apt_id}"
                 photo = apt.get("photo")
@@ -263,9 +336,16 @@ class RentalAggregator:
                 if not code:
                     continue
 
+                town_name = obj.get("townName") or ""
+                address = obj.get("address") or "Минск"
+                if town_name and "минск" not in town_name.lower():
+                    continue
+                if not is_minsk_city(f"{town_name} {address}"):
+                    continue
+
                 rooms = obj.get("rooms")
                 rooms_str = format_rooms(rooms)
-                title = f"{rooms_str} квартира"
+                title = format_rental_title(rooms_str)
 
                 rates = obj.get("priceRates", {})
                 # ISO: '840' is USD, '933' is BYN
@@ -274,7 +354,6 @@ class RentalAggregator:
                 usd_str = f"${int(usd_val):,} / мес.".replace(",", " ") if usd_val else "Договорная"
                 byn_str = f"{int(byn_val):,} BYN".replace(",", " ") if byn_val else ""
 
-                address = obj.get("address") or "Минск"
                 link = f"https://realt.by/rent/flat-for-long/object/{code}/"
 
                 images = obj.get("images", [])
@@ -284,6 +363,8 @@ class RentalAggregator:
                 desc = None
                 if story and isinstance(story, str):
                     desc = story.strip()
+                if is_sale_listing(title, desc or ""):
+                    continue
 
                 listings.append(
                     RentalListing(
