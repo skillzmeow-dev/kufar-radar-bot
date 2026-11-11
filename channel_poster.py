@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 from typing import Optional
 from aiogram import Bot
@@ -6,27 +7,46 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 import config
 from database import Database
-from rental_aggregator import RentalAggregator, RentalListing
+from rental_aggregator import RentalAggregator, RentalListing, is_sale_listing
 from kufar_client import KufarClient
 
 logger = logging.getLogger(__name__)
 
 
+def truncate_at_word(text: str, max_len: int = 300) -> str:
+    """Truncate text cleanly at a word or line boundary without cutting words in half."""
+    cleaned = text.strip()
+    if len(cleaned) <= max_len:
+        return cleaned
+    slice_head = cleaned[: max_len + 1]
+    cutoff = max(slice_head.rfind(" "), slice_head.rfind("\n"))
+    if cutoff < max_len // 2:
+        cutoff = max_len
+    return cleaned[:cutoff].rstrip(" \n\r\t,.;:-—") + "..."
+
+
 def build_channel_post(ad: RentalListing) -> tuple[str, InlineKeyboardMarkup]:
     quote_part = ""
     if ad.description:
-        clean_body = ad.description.strip().replace("<", "&lt;").replace(">", "&gt;")
-        if len(clean_body) > 300:
-            clean_body = clean_body[:300] + "..."
-        quote_part = f"\n<blockquote>{clean_body}</blockquote>"
+        clean_body = html.escape(truncate_at_word(ad.description, 300), quote=False)
+        if clean_body:
+            quote_part = f"\n<blockquote>{clean_body}</blockquote>"
+
+    byn_part = f" <i>({html.escape(ad.price_byn_str, quote=False)})</i>" if ad.price_byn_str else ""
+    safe_link = html.escape(ad.link, quote=True)
+    safe_title = html.escape(ad.title or "Квартира в Минске", quote=False)
+    safe_price_usd = html.escape(ad.price_usd_str or "Договорная", quote=False)
+    safe_location = html.escape(ad.location or "Минск", quote=False)
+    safe_rooms = html.escape(ad.rooms_str or "Квартира", quote=False)
+    safe_source = html.escape(ad.source_badge or ad.source, quote=False)
 
     text = (
         f"🏠 <b>Новая квартира в Минске [Собственник]</b>\n\n"
-        f"🏷 <b><a href=\"{ad.link}\">{ad.title}</a></b>\n"
-        f"💰 <b>Цена:</b> {ad.price_usd_str} <i>({ad.price_byn_str})</i>\n"
-        f"📍 <b>Адрес:</b> {ad.location}\n"
-        f"🏢 <b>Комнат:</b> {ad.rooms_str}\n"
-        f"🌐 <b>Источник:</b> {ad.source_badge}"
+        f"🏷 <b><a href=\"{safe_link}\">{safe_title}</a></b>\n"
+        f"💰 <b>Цена:</b> {safe_price_usd}{byn_part}\n"
+        f"📍 <b>Адрес:</b> {safe_location}\n"
+        f"🏢 <b>Комнат:</b> {safe_rooms}\n"
+        f"🌐 <b>Источник:</b> {safe_source}"
         f"{quote_part}\n\n"
         f"⚡ <i>Хотите получать такие квартиры за 10 секунд до публикации на канале? Подключите личный радар:</i> @kufar_radar_by_bot"
     )
@@ -143,6 +163,10 @@ class ChannelAutoPoster:
                         ad.description = full_body
                 except Exception:
                     pass
+
+            if is_sale_listing(ad.title, ad.description or ""):
+                logger.info("Skipping non-rental/sale listing before channel post: %s (%s)", ad.uid, ad.title)
+                return
 
             msg_text, kb = build_channel_post(ad)
 
